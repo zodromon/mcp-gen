@@ -24,9 +24,17 @@
  * unless the operator explicitly asks. `--host <addr>` opts into a different
  * interface (e.g. 0.0.0.0 for LAN exposure); choosing a non-loopback host prints
  * a loud one-line stderr warning, so the dangerous mode is never silent.
+ *
+ * Optional bearer-token auth makes an exposed server safe to deploy: configure
+ * one or more keys via `--api-key <key>` (repeatable) or the comma-separated
+ * MCP_GEN_API_KEYS env var. When ANY key is configured, auth is ON and every
+ * /mcp request must carry `Authorization: Bearer <key>` (fail-closed: a missing,
+ * malformed, or non-matching header is rejected with 401 BEFORE the SDK transport
+ * sees it, so no tool runs). With no keys configured auth is OFF and behavior is
+ * byte-for-byte unchanged. Keys are compared in constant time (timingSafeEqual).
  */
 import { createServer, type Server as HttpServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -66,6 +74,13 @@ export interface ServeOptions {
    * generator discovers the nearest tsconfig by walking up from the file.
    */
   tsconfig?: string;
+  /**
+   * Bearer-token keys collected from `--api-key` flags. Unioned with the
+   * comma-separated MCP_GEN_API_KEYS env var (see resolveApiKeys). When the
+   * resulting set is non-empty, auth is ON and every /mcp request must present a
+   * matching `Authorization: Bearer <key>`. Empty/omitted → auth OFF (unchanged).
+   */
+  apiKeys?: string[];
 }
 
 export interface ServeHandle {
@@ -97,9 +112,84 @@ export function isLoopbackHost(host: string): boolean {
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
+/**
+ * Parse the MCP_GEN_API_KEYS env var: comma-separated, each entry trimmed, empty
+ * entries dropped. `undefined`/empty → `[]`. Exported for tests.
+ */
+export function parseApiKeysEnv(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Union the bearer keys from the CLI (`--api-key` values) and the env var into a
+ * deduplicated set. Both sources are trimmed and empties dropped, so a stray
+ * `--api-key ""` can never silently enable auth with an empty key. A non-empty
+ * result means auth is ON. Exported for tests.
+ */
+export function resolveApiKeys(optionKeys: readonly string[] | undefined, env: string | undefined): string[] {
+  const set = new Set<string>();
+  for (const k of optionKeys ?? []) {
+    const t = k.trim();
+    if (t.length > 0) set.add(t);
+  }
+  for (const k of parseApiKeysEnv(env)) set.add(k);
+  return [...set];
+}
+
+/**
+ * Extract the token from an `Authorization: Bearer <token>` header, or `null` if
+ * the header is absent or not a well-formed Bearer credential (the scheme is
+ * case-insensitive per RFC 7235). The outer header is trimmed; the token is taken
+ * verbatim and compared exactly downstream.
+ */
+export function parseBearer(authHeader: string | undefined): string | null {
+  if (!authHeader) return null;
+  const m = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+  return m ? m[1] : null;
+}
+
+/** Constant-time string equality via timingSafeEqual, with the mandatory length
+ *  guard (timingSafeEqual throws on unequal-length buffers). A length mismatch
+ *  short-circuits to false without comparing bytes. */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Is `authHeader` a `Bearer <key>` whose key is one of `keys`? Each configured
+ * key is compared in constant time; the loop never short-circuits on a match, so
+ * neither a wrong key's bytes nor WHICH key matched leaks through timing. A
+ * missing/malformed header returns false (fail-closed). Exported for tests.
+ *
+ * Callers must only invoke this when auth is ON: with an empty `keys` it returns
+ * false (nothing can match), which would reject everything.
+ */
+export function isAuthorized(authHeader: string | undefined, keys: readonly string[]): boolean {
+  const token = parseBearer(authHeader);
+  if (token === null) return false;
+  let ok = false;
+  for (const key of keys) {
+    if (timingSafeEqualStr(token, key)) ok = true;
+  }
+  return ok;
+}
+
 export async function startServer(options: ServeOptions): Promise<ServeHandle> {
   const port = options.port ?? DEFAULT_PORT;
   const host = options.host ?? DEFAULT_HOST;
+
+  // Bearer keys: union the CLI `--api-key` values with the MCP_GEN_API_KEYS env
+  // var. A non-empty set turns auth ON (fail-closed enforcement below); empty
+  // leaves serve byte-for-byte unchanged.
+  const apiKeys = resolveApiKeys(options.apiKeys, process.env.MCP_GEN_API_KEYS);
+  const authEnabled = apiKeys.length > 0;
 
   // 1-3. Generate schemas, load the user's module, and build the callable
   //       registry — all through the shared seam, so serve and dev execute tools
@@ -135,7 +225,7 @@ export async function startServer(options: ServeOptions): Promise<ServeHandle> {
   const hasResources = bundle.resources.length > 0 || bundle.resourceTemplates.length > 0;
   const hasPrompts = bundle.prompts.length > 0;
   const server = new Server(
-    { name: "mcp-gen", version: "1.1.0" },
+    { name: "mcp-gen", version: "1.2.0" },
     {
       capabilities: {
         tools: {},
@@ -254,6 +344,15 @@ export async function startServer(options: ServeOptions): Promise<ServeHandle> {
   const httpServer = createServer((req, res) => {
     const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     if (reqUrl.pathname === "/mcp") {
+      // Fail-closed bearer auth: when keys are configured, reject any request
+      // without a valid `Authorization: Bearer <key>` BEFORE handing it to the SDK
+      // transport — so no tool, resource, or prompt code can run on a 401 path.
+      if (authEnabled && !isAuthorized(req.headers.authorization, apiKeys)) {
+        res
+          .writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" })
+          .end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
       transport.handleRequest(req, res).catch((err: unknown) => {
         console.error(
           `error handling /mcp request: ${err instanceof Error ? err.message : String(err)}`,
@@ -266,13 +365,26 @@ export async function startServer(options: ServeOptions): Promise<ServeHandle> {
   });
 
   // 7. Loopback by default. A non-loopback host means this arbitrary-code
-  //    endpoint is reachable off-machine with NO authentication — make that loud
-  //    and deliberate by warning BEFORE we bind, never silent.
-  if (!isLoopbackHost(host)) {
+  //    endpoint is reachable off-machine — make exposure loud and deliberate by
+  //    warning BEFORE we bind, never silent. Bearer auth changes the calculus:
+  //    with auth ON the endpoint is gated, so we suppress the scary "no auth"
+  //    warning and instead confirm auth is required; with auth OFF we keep the
+  //    loud warning and nudge the operator toward MCP_GEN_API_KEYS.
+  if (!isLoopbackHost(host) && !authEnabled) {
     console.error(
       `warning: serve is binding ${host} — this server executes local code when its tools are ` +
         `called and is now reachable from other machines on the network with NO authentication; ` +
         `omit --host (or pass --host 127.0.0.1) to keep it loopback-only.`,
+    );
+    console.error(
+      `hint: set MCP_GEN_API_KEYS=<comma-separated keys> (or pass --api-key <key>) to require a bearer ` +
+        `token before exposing it.`,
+    );
+  }
+  if (authEnabled) {
+    console.error(
+      `authentication: bearer token required — clients must send 'Authorization: Bearer <key>' ` +
+        `(${apiKeys.length} key${apiKeys.length === 1 ? "" : "s"} configured).`,
     );
   }
 

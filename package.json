@@ -1,10 +1,10 @@
 {
   "name": "@zodromon/mcp-gen",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publishConfig": {
     "access": "public"
   },
-  "description": "Generate MCP tool schemas from exported TypeScript functions via ts-morph and the type checker.",
+  "description": "Turn typed TypeScript functions into an MCP server: infers tool, resource, and prompt schemas from your types and JSDoc — with a live playground, a CI contract guard, and optional bearer-token auth for deployment.",
   "main": "dist/src/generate.js",
   "bin": {
     "mcp-gen": "dist/generate-mcp-schemas.js"
@@ -21,10 +21,13 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "mcp-server",
     "typescript",
     "json-schema",
     "ts-morph",
     "codegen",
+    "resources",
+    "prompts",
     "cli"
   ],
   "author": "Zhodra",

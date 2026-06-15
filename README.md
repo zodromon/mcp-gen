@@ -71,7 +71,9 @@ Or run it as a real MCP server:
 mcp-gen serve tools.ts --port 3000
 ```
 
-`serve` binds **`127.0.0.1` (loopback) by default** — it executes your local code when its tools are called, so it isn't reachable off-machine unless you ask. To expose it on the network, opt in explicitly with `--host` (e.g. `mcp-gen serve tools.ts --host 0.0.0.0`); doing so prints a warning, since the endpoint is then reachable by other machines with no authentication.
+`serve` binds **`127.0.0.1` (loopback) by default** — it executes your local code when its tools are called, so it isn't reachable off-machine unless you ask. To expose it on the network, opt in explicitly with `--host` (e.g. `mcp-gen serve tools.ts --host 0.0.0.0`); doing so prints a warning, since the endpoint is then reachable by other machines.
+
+Before exposing it, turn on **bearer-token authentication**. Configure one or more keys with `--api-key <key>` (repeatable) or the comma-separated `MCP_GEN_API_KEYS` environment variable — if any key is set, auth is **on** and every request to `/mcp` must carry `Authorization: Bearer <key>` (a missing, malformed, or wrong key is rejected with `401` before any tool runs). With no keys set, auth is off and behavior is unchanged. When auth is on, the off-machine "no authentication" warning is replaced by a one-line confirmation that a token is required. See [Deploying to production](#deploying-to-production).
 
 That's it. The parameter names, types, required-ness, and descriptions all come from the code you already wrote.
 
@@ -148,10 +150,10 @@ Run `mcp-gen serve` and a connected MCP client can list and read your resources 
 ## CLI
 
 ```
-mcp-gen <file.ts> [--debug] [--tsconfig <path>]                              Generate tool schemas as JSON (stdout)
-mcp-gen serve <file.ts> [--port N] [--host <addr>] [--tsconfig <path>]       Start a live MCP server (default port 3000; binds 127.0.0.1)
-mcp-gen dev <file.ts> [--port N] [--tsconfig <path>]                         Live playground UI, watches + reloads (default port 4000)
-mcp-gen check <file.ts> [--update] [--snapshot <path>] [--tsconfig <path>]   Guard the tool surface against breaking changes (CI)
+mcp-gen <file.ts> [--debug] [--tsconfig <path>]                                        Generate tool schemas as JSON (stdout)
+mcp-gen serve <file.ts> [--port N] [--host <addr>] [--api-key <key>]... [--tsconfig <path>]   Start a live MCP server (default port 3000; binds 127.0.0.1; PORT/HOST env honored)
+mcp-gen dev <file.ts> [--port N] [--tsconfig <path>]                                   Live playground UI, watches + reloads (default port 4000)
+mcp-gen check <file.ts> [--update] [--snapshot <path>] [--tsconfig <path>]             Guard the tool surface against breaking changes (CI)
 ```
 
 Generation writes machine-readable JSON to **stdout** (always includes `tools`; includes `errors`/`warnings` when present); human-readable messages go to **stderr**. Exit codes:
@@ -161,6 +163,26 @@ Generation writes machine-readable JSON to **stdout** (always includes `tools`; 
 | `0` | every exported function converted cleanly |
 | `1` | one or more functions failed — clean ones are still emitted, failures listed in `errors` |
 | `2` | file-level failure (not found / unparseable / nothing servable) |
+
+### Deploying to production
+
+To run `serve` as a network-reachable MCP server, bind a public interface **and** require a bearer token. Pass the keys through the environment (not `--api-key`) so the secret never lands in shell history or a process listing:
+
+```bash
+# one or more comma-separated keys; every caller must send `Authorization: Bearer <key>`
+MCP_GEN_API_KEYS="$(openssl rand -hex 32)" mcp-gen serve tools.ts --host 0.0.0.0
+```
+
+- **Keys via env in prod, not the CLI.** `--api-key` is convenient for local testing, but a flag is visible to anyone who can list processes (`ps`); `MCP_GEN_API_KEYS` keeps the secret out of `argv`. Both sources are unioned, comma-split, and trimmed, and any non-empty key turns auth on.
+- **`PORT` / `HOST` are honored.** When you omit `--port` / `--host`, `serve` falls back to the `PORT` and `HOST` environment variables before its defaults (`3000` / `127.0.0.1`) — so it drops straight into a platform that injects `PORT`. An explicit `--port` / `--host` flag always overrides the env var.
+- **Auth is fail-closed.** With keys configured, a request to `/mcp` carrying a missing, malformed, or non-matching token is rejected with `401 {"error":"unauthorized"}` *before* the MCP transport — so no tool, resource, or prompt code runs. Keys are compared in constant time.
+- **No keys = exposed and unauthenticated.** Bind a non-loopback `--host` (or `HOST`) without any key configured and `serve` keeps printing the loud exposure warning. Configure a key to gate the endpoint (and silence the warning).
+
+On a platform that injects `PORT` (and optionally `HOST`), you supply only the keys:
+
+```bash
+MCP_GEN_API_KEYS="key-a,key-b" mcp-gen serve tools.ts --host 0.0.0.0   # PORT taken from the environment
+```
 
 ### Guarding the contract — `check`
 

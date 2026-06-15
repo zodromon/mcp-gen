@@ -100,12 +100,18 @@ export function runCli(argv: string[]): number {
 }
 
 /**
- * The serve subcommand: `mcp-gen serve <file.ts> [--port N] [--host <addr>]`.
+ * The serve subcommand:
+ * `mcp-gen serve <file.ts> [--port N] [--host <addr>] [--api-key <key>]... [--tsconfig <path>]`.
  *
  * Binds 127.0.0.1 (loopback) by default — the served runtime executes local code
  * on request, so it stays off-network unless `--host` opts in (e.g. 0.0.0.0 for
  * LAN exposure, which logs a loud warning). `dev` has no `--host` and is always
  * loopback.
+ *
+ * Bearer auth: `--api-key <key>` (repeatable) and the comma-separated
+ * MCP_GEN_API_KEYS env var configure keys; any configured key turns auth ON.
+ * Deploy ergonomics: when `--port`/`--host` are omitted, the PORT/HOST env vars
+ * are honored before the hardcoded defaults (CLI flags always override env).
  *
  * Returns an exit code; on a successful start it returns 0 but the process
  * stays alive because the HTTP server keeps the event loop busy. The serve
@@ -117,15 +123,19 @@ export function runCli(argv: string[]): number {
  *   exit 1 — the serve runtime could not be loaded.
  */
 export async function runServe(argv: string[]): Promise<number> {
-  const parsed = parseServerArgs(argv, DEFAULT_SERVE_PORT, { acceptHost: true });
+  const parsed = parseServerArgs(argv, serveDefaultPort(process.env.PORT), {
+    acceptHost: true,
+    acceptApiKey: true,
+  });
   if (parsed.error) {
     console.error(`error: ${parsed.error}`);
     return 2;
   }
   if (!parsed.file) {
     console.error(
-      "Usage: mcp-gen serve <file.ts> [--port N] [--host <addr>] [--tsconfig <path>]\n" +
-        "       Binds 127.0.0.1 (loopback) by default; pass --host 0.0.0.0 to expose on the network.",
+      "Usage: mcp-gen serve <file.ts> [--port N] [--host <addr>] [--api-key <key>]... [--tsconfig <path>]\n" +
+        "       Binds 127.0.0.1 (loopback) by default; pass --host 0.0.0.0 to expose on the network.\n" +
+        "       Set MCP_GEN_API_KEYS (or pass --api-key) to require a bearer token. PORT/HOST env vars are honored.",
     );
     return 2;
   }
@@ -144,8 +154,9 @@ export async function runServe(argv: string[]): Promise<number> {
     await startServer({
       file: parsed.file,
       port: parsed.port,
-      host: parsed.host,
+      host: resolveBindHost(parsed.host, process.env.HOST),
       tsconfig: parsed.tsconfig,
+      apiKeys: parsed.apiKeys,
     });
     return 0;
   } catch (err) {
@@ -408,6 +419,11 @@ interface ServerArgs {
   /** Explicit bind address; only ever set on the serve path (see acceptHost). */
   host?: string;
   tsconfig?: string;
+  /**
+   * Bearer-token keys from `--api-key` flags (repeatable). Always present (empty
+   * when none). Only ever populated on the serve path (see acceptApiKey).
+   */
+  apiKeys: string[];
   error?: string;
 }
 
@@ -419,6 +435,12 @@ interface ServerArgsOptions {
    * binding — dev's behavior is otherwise unchanged.
    */
   acceptHost?: boolean;
+  /**
+   * Whether `--api-key <key>` is a valid (repeatable) flag. ONLY serve sets this.
+   * dev rejects it outright: the playground is always unauthenticated and
+   * loopback-only, so accepting an auth flag there would be misleading.
+   */
+  acceptApiKey?: boolean;
 }
 
 /**
@@ -431,7 +453,12 @@ interface ServerArgsOptions {
  * `opts.acceptHost`. When serve enables it, its value is consumed here (so an
  * address is never mistaken for the input file) and surfaced as `host`. When dev
  * leaves it disabled, `--host` is REJECTED with an error — dev never binds
- * anything but 127.0.0.1. Exported for unit tests.
+ * anything but 127.0.0.1.
+ *
+ * `--api-key <key>` (or `--api-key=<key>`) is serve-only and gated by
+ * `opts.acceptApiKey`; it is repeatable and each value is collected into
+ * `apiKeys`. When dev leaves it disabled it is REJECTED — the playground is
+ * always unauthenticated. Exported for unit tests.
  */
 export function parseServerArgs(
   argv: string[],
@@ -439,23 +466,25 @@ export function parseServerArgs(
   opts: ServerArgsOptions = {},
 ): ServerArgs {
   const acceptHost = opts.acceptHost ?? false;
+  const acceptApiKey = opts.acceptApiKey ?? false;
   let port = defaultPort;
   let file: string | undefined;
   let host: string | undefined;
   let tsconfig: string | undefined;
+  const apiKeys: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port") {
       const raw = argv[++i];
       const v = Number(raw);
       if (raw === undefined || !Number.isInteger(v) || v < 0 || v > 65535) {
-        return { file, port, host, error: "--port requires an integer in 0-65535" };
+        return { file, port, host, apiKeys, error: "--port requires an integer in 0-65535" };
       }
       port = v;
     } else if (a.startsWith("--port=")) {
       const v = Number(a.slice("--port=".length));
       if (!Number.isInteger(v) || v < 0 || v > 65535) {
-        return { file, port, host, error: "--port requires an integer in 0-65535" };
+        return { file, port, host, apiKeys, error: "--port requires an integer in 0-65535" };
       }
       port = v;
     } else if (a === "--host" || a.startsWith("--host=")) {
@@ -463,15 +492,35 @@ export function parseServerArgs(
         return {
           file,
           port,
+          apiKeys,
           error: "--host is not supported for dev (the playground always binds 127.0.0.1)",
         };
       }
       if (a === "--host") {
         host = argv[++i];
-        if (host === undefined) return { file, port, error: "--host requires an address" };
+        if (host === undefined) return { file, port, apiKeys, error: "--host requires an address" };
       } else {
         host = a.slice("--host=".length);
-        if (host === "") return { file, port, error: "--host requires an address" };
+        if (host === "") return { file, port, apiKeys, error: "--host requires an address" };
+      }
+    } else if (a === "--api-key" || a.startsWith("--api-key=")) {
+      if (!acceptApiKey) {
+        return {
+          file,
+          port,
+          host,
+          apiKeys,
+          error: "--api-key is not supported for dev (the playground is always unauthenticated and loopback-only)",
+        };
+      }
+      if (a === "--api-key") {
+        const v = argv[++i];
+        if (v === undefined) return { file, port, host, apiKeys, error: "--api-key requires a value" };
+        apiKeys.push(v);
+      } else {
+        const v = a.slice("--api-key=".length);
+        if (v === "") return { file, port, host, apiKeys, error: "--api-key requires a value" };
+        apiKeys.push(v);
       }
     } else if (a === "--tsconfig") {
       tsconfig = argv[++i];
@@ -481,7 +530,32 @@ export function parseServerArgs(
       file = a;
     }
   }
-  return { file, port, host, tsconfig };
+  return { file, port, host, tsconfig, apiKeys };
+}
+
+/**
+ * Effective serve port BEFORE a `--port` flag is applied: the PORT env var when
+ * it parses as a valid 0-65535 integer, else the hardcoded default. Passed to
+ * parseServerArgs as its default, so a `--port` flag always overrides it —
+ * giving the precedence CLI flag > PORT env > default. Exported for tests.
+ */
+export function serveDefaultPort(envPort: string | undefined, dflt: number = DEFAULT_SERVE_PORT): number {
+  if (envPort !== undefined && envPort.trim() !== "") {
+    const v = Number(envPort);
+    if (Number.isInteger(v) && v >= 0 && v <= 65535) return v;
+  }
+  return dflt;
+}
+
+/**
+ * Effective bind host before startServer applies its loopback default: a `--host`
+ * flag wins, else the HOST env var (trimmed), else undefined (→ 127.0.0.1
+ * downstream). Precedence: CLI flag > HOST env > default. Exported for tests.
+ */
+export function resolveBindHost(flagHost: string | undefined, envHost: string | undefined): string | undefined {
+  if (flagHost !== undefined) return flagHost;
+  const e = envHost?.trim();
+  return e ? e : undefined;
 }
 
 /** Render one function-level failure as human-readable stderr lines. */
