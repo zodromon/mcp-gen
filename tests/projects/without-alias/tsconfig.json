@@ -1,0 +1,12 @@
+{
+  "// purpose": "Control for the discovery win. Byte-identical to with-tsconfig/tsconfig.json EXCEPT it omits the `@ext/*` paths alias. The same `@ext/types` import that resolves over there is unresolvable here, so configureWidget still fail-louds — isolating the discovered tsconfig's `paths` as the one variable that fixes case 5b.",
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "types": []
+  },
+  "include": ["**/*.ts"]
+}

@@ -1,0 +1,19 @@
+{
+  "// purpose": "Emitting build config for the shipped `mcp-gen` binary. Distinct from the root tsconfig.json, which is a noEmit typecheck config (module ESNext / Bundler). This one emits runnable CommonJS into dist/ so the tool runs as plain `node dist/...` with no tsx. ts-morph + typescript stay runtime dependencies (the tool invokes the checker at runtime); they are required, not bundled away.",
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": false,
+    "sourceMap": false,
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["generate-mcp-schemas.ts", "src/**/*.ts"]
+}

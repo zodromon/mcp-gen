@@ -1,0 +1,70 @@
+﻿{
+  "tools": [
+    {
+      "name": "updateProfile",
+      "description": "Updates a user profile (type imported from a sibling file that exists on disk).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "profile": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "displayName": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "address": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "zip": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "displayName",
+              "tags"
+            ],
+            "description": "The profile to update"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "admin",
+              "editor",
+              "viewer"
+            ],
+            "description": "The role to assign"
+          }
+        },
+        "required": [
+          "profile",
+          "role"
+        ]
+      },
+      "_returnType": {
+        "text": "boolean",
+        "awaitedSchema": {
+          "type": "boolean"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+﻿{
+  "tools": [
+    {
+      "name": "createUser",
+      "description": "Creates a user account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "opts": {
+            "type": "object",
+            "properties": {
+              "email": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "admin",
+                  "user"
+                ]
+              }
+            },
+            "required": [
+              "email",
+              "role"
+            ],
+            "description": "The user creation options"
+          }
+        },
+        "required": [
+          "opts"
+        ]
+      },
+      "_returnType": {
+        "text": "{ id: string; }",
+        "awaitedSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      }
+    },
+    {
+      "name": "createUserNested",
+      "description": "Variant with nesting and optionals inside the object.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "opts": {
+            "type": "object",
+            "properties": {
+              "email": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "admin",
+                  "user"
+                ]
+              },
+              "profile": {
+                "type": "object",
+                "properties": {
+                  "displayName": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "age": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "displayName",
+                  "tags"
+                ]
+              }
+            },
+            "required": [
+              "email",
+              "role"
+            ]
+          }
+        },
+        "required": [
+          "opts"
+        ]
+      },
+      "_returnType": {
+        "text": "void",
+        "awaitedSchema": {
+          "$comment": "void"
+        }
+      }
+    }
+  ]
+}

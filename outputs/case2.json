@@ -1,0 +1,33 @@
+﻿{
+  "tools": [
+    {
+      "name": "search",
+      "description": "Searches for items matching a query.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search query"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max number of results (defaults to 10)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "_returnType": {
+        "text": "string[]",
+        "awaitedSchema": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

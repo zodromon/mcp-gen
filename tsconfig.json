@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["generate-mcp-schemas.ts", "src", "tests", "vitest.config.ts"],
+  "// exclude": "tests/projects holds self-contained mini-projects (each with its OWN tsconfig — path aliases, an intentionally-unresolvable control import) used as generateTools fixtures. They resolve only under their own tsconfig, not this root one, so they are out of scope for the root typecheck — like fixtures/, which this root config also does not include.",
+  "exclude": ["tests/projects"]
+}

@@ -1,0 +1,31 @@
+﻿{
+  "tools": [
+    {
+      "name": "greet",
+      "description": "Greets a person by name and age.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The person's name"
+          },
+          "age": {
+            "type": "number",
+            "description": "The person's age in years"
+          }
+        },
+        "required": [
+          "name",
+          "age"
+        ]
+      },
+      "_returnType": {
+        "text": "string",
+        "awaitedSchema": {
+          "type": "string"
+        }
+      }
+    }
+  ]
+}

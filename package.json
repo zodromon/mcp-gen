@@ -1,0 +1,49 @@
+{
+  "name": "mcp-gen",
+  "version": "1.0.0",
+  "description": "Generate MCP tool schemas from exported TypeScript functions via ts-morph and the type checker.",
+  "main": "dist/src/generate.js",
+  "bin": {
+    "mcp-gen": "dist/generate-mcp-schemas.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc",
+    "generate": "tsx generate-mcp-schemas.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "typescript",
+    "json-schema",
+    "ts-morph",
+    "codegen",
+    "cli"
+  ],
+  "author": "Zhodra",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zodromon/mcp-gen.git"
+  },
+  "homepage": "https://github.com/zodromon/mcp-gen#readme",
+  "bugs": {
+    "url": "https://github.com/zodromon/mcp-gen/issues"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "jiti": "^2.7.0",
+    "ts-morph": "^28.0.0",
+    "typescript": "^6.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "vitest": "^4.1.8"
+  }
+}
