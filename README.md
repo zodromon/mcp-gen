@@ -144,7 +144,23 @@ Crucially, the playground runs each tool through the **exact same path** as `mcp
 
 ## Install
 
-Not yet published to a registry. To use it from source:
+```bash
+npm install -g @zodromon/mcp-gen
+```
+
+The package is scoped (`@zodromon/mcp-gen`), but the command you run is just `mcp-gen`:
+
+```bash
+mcp-gen tools.ts
+```
+
+Or run it without installing, via `npx`:
+
+```bash
+npx @zodromon/mcp-gen tools.ts
+```
+
+**From source** (to develop or contribute):
 
 ```bash
 git clone https://github.com/zodromon/mcp-gen && cd mcp-gen
