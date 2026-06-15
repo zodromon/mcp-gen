@@ -2,7 +2,7 @@
 
 > Turn your typed TypeScript functions into an MCP server. No schema library, no decorators, no boilerplate — the schema is inferred from your types.
 
-`mcp-gen` reads exported TypeScript functions and generates [Model Context Protocol](https://modelcontextprotocol.io) tool definitions from them — using the TypeScript type checker (via [ts-morph](https://ts-morph.com)) to turn each parameter type into a JSON Schema and each JSDoc comment into a description. It can emit the schemas as JSON, serve a live MCP server, or open a **live playground** where you call your tools in a browser while you edit.
+`mcp-gen` reads exported TypeScript functions and generates [Model Context Protocol](https://modelcontextprotocol.io) **tool, resource, and prompt** definitions from them — using the TypeScript type checker (via [ts-morph](https://ts-morph.com)) to turn each parameter type into a JSON Schema and each JSDoc comment into a description. It can emit the schemas as JSON, serve a live MCP server, or open a **live playground** where you call your tools in a browser while you edit.
 
 If your functions are typed, they're already MCP tools.
 
@@ -91,6 +91,59 @@ It's built to work on real codebases, not just single-file toys:
 - `tsconfig.json` discovery and path-alias resolution
 - detection of non-serializable types (instead of emitting invalid schema)
 - `async` functions (awaited return types); a throwing tool returns `isError` rather than taking the server down
+
+## Resources & prompts
+
+MCP servers can expose three kinds of things — **tools** (actions), **resources** (data), and **prompts** (reusable templates). `mcp-gen` infers all three from the same typed exports; a single JSDoc tag picks which one. **An untagged function is a tool, exactly as before — nothing changes for existing code.**
+
+### Resources — `@resource <uri>`
+
+Tag a function with `@resource` and a URI. If the URI has `{placeholders}` that match parameter names, it becomes a **resource template** (the params validate the URL); with no placeholders it's a **static resource**. The return value is the content — a `string` is served as `text/plain`, anything else as `application/json`. Add `@mime <type>` to override.
+
+```ts
+/**
+ * Read a user record by id.
+ * @resource users://{id}      — templated: {id} matches the `id` param
+ * @param id - The user id
+ */
+export function getUser(id: string): { id: string; name: string } {
+  return { id, name: `User ${id}` };
+}
+
+/**
+ * The current app configuration.
+ * @resource config://app       — static: no placeholders
+ */
+export function appConfig() {
+  return { theme: "dark", version: "1.1.0" };
+}
+
+/**
+ * @resource info://build
+ * @mime text/plain             — override the content type
+ */
+export function buildInfo(): string {
+  return "mcp-gen build 1.1.0";
+}
+```
+
+### Prompts — `@prompt`
+
+Tag a function with `@prompt`. Its parameters become the prompt's arguments (names and descriptions from `@param`). Return a **string** for a single user message, or an array of `{ role, content }` messages to pass them through as-is.
+
+```ts
+/**
+ * A code-review prompt.
+ * @prompt
+ * @param language - The programming language
+ * @param code - The code to review
+ */
+export function reviewPrompt(language: string, code: string): string {
+  return `Please review this ${language} code:\n\n${code}`;
+}
+```
+
+Run `mcp-gen serve` and a connected MCP client can list and read your resources and get your prompts, alongside calling tools. Resources and prompts go through the **exact same path** as tools — same type inference, same validation, same execution — and the same fail-loud rule applies: e.g. a `@resource` template whose `{var}` doesn't match a parameter is excluded and reported, never half-registered.
 
 ## CLI
 

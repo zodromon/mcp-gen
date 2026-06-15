@@ -62,10 +62,18 @@ export function runCli(argv: string[]): number {
     return 2;
   }
 
-  const { tools, errors, warnings, rawTypeDebug, compilerDiagnostics } = result;
+  const { tools, resources, resourceTemplates, prompts, errors, warnings, rawTypeDebug, compilerDiagnostics } =
+    result;
 
   // --- human-readable -> stderr ---
-  if (tools.length === 0 && errors.length === 0 && warnings.length === 0) {
+  if (
+    tools.length === 0 &&
+    resources.length === 0 &&
+    resourceTemplates.length === 0 &&
+    prompts.length === 0 &&
+    errors.length === 0 &&
+    warnings.length === 0
+  ) {
     console.error(`No exported functions found in ${filePath}`);
   }
   for (const e of errors) {
@@ -76,7 +84,12 @@ export function runCli(argv: string[]): number {
   }
 
   // --- machine-readable JSON -> stdout ---
+  // `tools` stays exactly as before; the resource/prompt arrays are added only
+  // when non-empty, so a tool-only file's output is byte-for-byte unchanged.
   const out: Record<string, unknown> = { tools };
+  if (resources.length > 0) out.resources = resources;
+  if (resourceTemplates.length > 0) out.resourceTemplates = resourceTemplates;
+  if (prompts.length > 0) out.prompts = prompts;
   if (errors.length > 0) out.errors = errors;
   if (warnings.length > 0) out.warnings = warnings;
   if (debug) out.rawTypeDebug = rawTypeDebug;

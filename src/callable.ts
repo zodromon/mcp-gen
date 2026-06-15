@@ -26,7 +26,14 @@
  */
 import * as path from "node:path";
 import { createJiti } from "jiti";
-import { generateTools, type McpToolDefinition, type ToolError } from "./generate";
+import {
+  generateTools,
+  type McpToolDefinition,
+  type McpResourceDefinition,
+  type McpResourceTemplateDefinition,
+  type McpPromptDefinition,
+  type ToolError,
+} from "./generate";
 
 /** One servable tool: schema for display, fn + paramOrder for dispatch. */
 export interface CallableTool {
@@ -61,6 +68,49 @@ export type InvokeOutcome =
   | { kind: "unknownTool"; message: string }
   | { kind: "invalidParams"; message: string };
 
+/** One message of a prompt result. `content` is a content block, passed through. */
+export interface PromptMessage {
+  role: "user" | "assistant";
+  content: unknown;
+}
+
+/**
+ * The neutral result of reading a resource through the shared path. Mirrors
+ * InvokeOutcome: the function runs identically to a tool (same loader, same
+ * validation, same throw→error handling), and the read serializes the return —
+ * a string → text/plain, anything else → application/json (an `@mime` tag
+ * overrides). serve maps these onto resources/read.
+ *
+ *   - ok               → the function ran; (uri, mimeType, text) is the content.
+ *   - toolError        → the function threw (serve: InternalError).
+ *   - unknownResource  → no static resource or template matched the URI.
+ *   - invalidParams    → extracted URI values failed schema validation; fn NOT called.
+ */
+export type ReadResourceOutcome =
+  | { kind: "ok"; uri: string; mimeType: string; text: string }
+  | { kind: "toolError"; message: string }
+  | { kind: "unknownResource"; message: string }
+  | { kind: "invalidParams"; message: string };
+
+/**
+ * The neutral result of getting a prompt through the shared path. The function
+ * runs like a tool; its return is shaped into messages — a string → a single
+ * user text message, an array of `{ role, content }` → passed through.
+ *
+ *   - ok             → (description, messages) is the prompt result.
+ *   - toolError      → the function threw (serve: InternalError).
+ *   - unknownPrompt  → no prompt with that name.
+ *   - invalidParams  → supplied arguments failed validation; fn NOT called.
+ *   - invalidReturn  → the function returned a shape we can't turn into messages
+ *                      (fail-loud; serve: InternalError).
+ */
+export type GetPromptOutcome =
+  | { kind: "ok"; description: string; messages: PromptMessage[] }
+  | { kind: "toolError"; message: string }
+  | { kind: "unknownPrompt"; message: string }
+  | { kind: "invalidParams"; message: string }
+  | { kind: "invalidReturn"; message: string };
+
 /**
  * Thrown when there is nothing servable. The seam itself never throws this
  * (emptiness is visible via an empty `tools`); it lives here as the shared
@@ -94,12 +144,29 @@ export interface CallableBundle {
   errors: ToolError[];
   /** Soft notes from generateTools (constraint widening, `{}` fallback, …). */
   warnings: string[];
-  /** Generated tools that had no matching runtime export (not served). */
+  /** Servable static resources (only those with a matching export). */
+  resources: McpResourceDefinition[];
+  /** Servable resource templates (only those with a matching export). */
+  resourceTemplates: McpResourceTemplateDefinition[];
+  /** Servable prompts (only those with a matching export). */
+  prompts: McpPromptDefinition[];
+  /** Generated primitives (tool/resource/prompt) with no matching export (not served). */
   skipped: SkippedExport[];
   /** Names of the tools actually callable (registry order). */
   toolNames: string[];
   /** Run a tool exactly the way serve would: validate → named→positional → await. */
   invoke(name: string, args: Record<string, unknown>): Promise<InvokeOutcome>;
+  /**
+   * Read a resource by URI through the SAME callable path a tool uses: match a
+   * static URI or a template, validate the extracted variables, run the function,
+   * serialize the return. Returns unknownResource when nothing matches.
+   */
+  readResource(uri: string): Promise<ReadResourceOutcome>;
+  /**
+   * Get a prompt by name through the SAME callable path: validate the supplied
+   * arguments, run the function, shape the return into messages.
+   */
+  getPrompt(name: string, args: Record<string, string>): Promise<GetPromptOutcome>;
 }
 
 /**
@@ -118,7 +185,9 @@ export async function loadCallableTools(
 
   // 1. Generate schemas. May throw on a file-level failure. The tsconfig
   //    override (or discovery, when unset) governs how imported types resolve.
-  const { tools, errors, warnings } = generateTools(absFile, { tsconfig: options.tsconfig });
+  const { tools, resources, resourceTemplates, prompts, errors, warnings } = generateTools(absFile, {
+    tsconfig: options.tsconfig,
+  });
 
   // 2. Load the user's module at runtime (no build step). jiti strips types and
   //    returns the named exports. dev disables the module/fs caches so a re-load
@@ -128,29 +197,81 @@ export async function loadCallableTools(
     : createJiti(absFile);
   const mod = (await jiti.import(absFile)) as Record<string, unknown>;
 
-  // 3. Build the registry: map each clean tool to its same-named export. A tool
-  //    with no matching function export is recorded as skipped (not served).
-  const registry = new Map<string, CallableTool>();
-  const servableTools: McpToolDefinition[] = [];
   const skipped: SkippedExport[] = [];
-  for (const tool of tools) {
-    const exported = mod[tool.name];
+
+  /** Resolve a generated primitive's same-named export, or record it skipped. */
+  const resolveExport = (name: string, kind: string): ((...args: unknown[]) => unknown) | null => {
+    const exported = mod[name];
     if (typeof exported !== "function") {
       skipped.push({
-        name: tool.name,
-        reason: `no matching export (expected an exported function named '${tool.name}')`,
+        name,
+        reason: `no matching export (expected an exported function named '${name}' for this ${kind})`,
       });
-      continue;
+      return null;
     }
+    return exported as (...args: unknown[]) => unknown;
+  };
+
+  // 3. Build the tool registry: map each clean tool to its same-named export. A
+  //    tool with no matching function export is recorded as skipped (not served).
+  const registry = new Map<string, CallableTool>();
+  const servableTools: McpToolDefinition[] = [];
+  for (const tool of tools) {
+    const exported = resolveExport(tool.name, "tool");
+    if (!exported) continue;
     const properties = (tool.inputSchema.properties ?? {}) as Record<string, unknown>;
     registry.set(tool.name, {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
       paramOrder: Object.keys(properties),
-      fn: exported as (...args: unknown[]) => unknown,
+      fn: exported,
     });
     servableTools.push(tool);
+  }
+
+  // 3b. Resource registries: static URIs keyed for O(1) exact match; templates
+  //     carry a compiled matcher + the tool-style inputSchema for validation.
+  const staticResources = new Map<string, StaticResourceEntry>();
+  const servableResources: McpResourceDefinition[] = [];
+  for (const r of resources) {
+    const exported = resolveExport(r.name, "resource");
+    if (!exported) continue;
+    staticResources.set(r.uri, { fn: exported, mimeType: r.mimeType });
+    servableResources.push(r);
+  }
+
+  const templateEntries: TemplateEntry[] = [];
+  const servableTemplates: McpResourceTemplateDefinition[] = [];
+  for (const t of resourceTemplates) {
+    const exported = resolveExport(t.name, "resource template");
+    if (!exported) continue;
+    const properties = (t.inputSchema.properties ?? {}) as Record<string, unknown>;
+    templateEntries.push({
+      def: t,
+      fn: exported,
+      regex: templateToRegex(t.uriTemplate),
+      // paramOrder spans ALL params (declaration order), so non-variable params
+      // map to `undefined` at dispatch and the function's JS defaults fire.
+      paramOrder: Object.keys(properties),
+    });
+    servableTemplates.push(t);
+  }
+
+  // 3c. Prompt registry: param order for dispatch + a string-typed input schema
+  //     (prompt arguments cross the wire as strings) for the shared validator.
+  const promptRegistry = new Map<string, PromptEntry>();
+  const servablePrompts: McpPromptDefinition[] = [];
+  for (const p of prompts) {
+    const exported = resolveExport(p.name, "prompt");
+    if (!exported) continue;
+    promptRegistry.set(p.name, {
+      def: p,
+      fn: exported,
+      paramOrder: p.arguments.map((a) => a.name),
+      inputSchema: promptArgsToSchema(p.arguments),
+    });
+    servablePrompts.push(p);
   }
 
   const invoke = async (
@@ -167,29 +288,262 @@ export async function loadCallableTools(
     const validationError = validateArguments(entry.inputSchema, args ?? {}, name);
     if (validationError) return { kind: "invalidParams", message: validationError };
 
-    try {
-      // Named → positional: rebuild the argument list in the schema's parameter
-      // order. Omitted optional params arrive as `undefined`, so JS defaults
-      // fire. await covers both sync and async functions.
-      const positional = entry.paramOrder.map((p) => args[p]);
-      const result = await entry.fn(...positional);
-      const text = typeof result === "string" ? result : safeStringify(result);
-      return { kind: "ok", text };
-    } catch (err) {
-      // A throwing tool must never crash the host — surface it as a tool error.
-      const message = err instanceof Error ? err.message : String(err);
-      return { kind: "toolError", message };
+    const run = await runCallable(entry.fn, entry.paramOrder, args ?? {});
+    if (!run.ok) return { kind: "toolError", message: run.message };
+    const text = typeof run.value === "string" ? run.value : safeStringify(run.value);
+    return { kind: "ok", text };
+  };
+
+  const readResource = async (uri: string): Promise<ReadResourceOutcome> => {
+    // Exact static match first; the function takes no arguments.
+    const stat = staticResources.get(uri);
+    if (stat) {
+      const run = await runCallable(stat.fn, [], {});
+      if (!run.ok) return { kind: "toolError", message: run.message };
+      return serializeResource(uri, run.value, stat.mimeType);
     }
+    // Otherwise, the first template whose pattern matches. Extracted variables
+    // are coerced to their declared types, then validated with the SAME tool-arg
+    // validator before the function runs — fail-loud on a value that doesn't fit.
+    for (const t of templateEntries) {
+      const match = t.regex.exec(uri);
+      if (!match) continue;
+      const groups = match.groups ?? {};
+      const raw: Record<string, unknown> = {};
+      for (const v of t.def.variables) raw[v] = decodeMaybe(groups[v] ?? "");
+      const coerced = coerceVars(raw, t.def.inputSchema);
+      const validationError = validateArguments(t.def.inputSchema, coerced, t.def.name);
+      if (validationError) return { kind: "invalidParams", message: validationError };
+      const run = await runCallable(t.fn, t.paramOrder, coerced);
+      if (!run.ok) return { kind: "toolError", message: run.message };
+      return serializeResource(uri, run.value, t.def.mimeType);
+    }
+    return { kind: "unknownResource", message: `Unknown resource: ${uri}` };
+  };
+
+  const getPrompt = async (
+    name: string,
+    args: Record<string, string>,
+  ): Promise<GetPromptOutcome> => {
+    const entry = promptRegistry.get(name);
+    if (!entry) return { kind: "unknownPrompt", message: `Unknown prompt: ${name}` };
+
+    const validationError = validateArguments(entry.inputSchema, args ?? {}, name);
+    if (validationError) return { kind: "invalidParams", message: validationError };
+
+    const run = await runCallable(entry.fn, entry.paramOrder, args ?? {});
+    if (!run.ok) return { kind: "toolError", message: run.message };
+    const shaped = shapePromptMessages(run.value);
+    if (!shaped.ok) return { kind: "invalidReturn", message: shaped.message };
+    return { kind: "ok", description: entry.def.description, messages: shaped.messages };
   };
 
   return {
     file: absFile,
     tools: servableTools,
+    resources: servableResources,
+    resourceTemplates: servableTemplates,
+    prompts: servablePrompts,
     errors,
     warnings,
     skipped,
     toolNames: [...registry.keys()],
     invoke,
+    readResource,
+    getPrompt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Registry entry shapes + the shared execution core
+// ---------------------------------------------------------------------------
+
+interface StaticResourceEntry {
+  fn: (...args: unknown[]) => unknown;
+  mimeType?: string;
+}
+
+interface TemplateEntry {
+  def: McpResourceTemplateDefinition;
+  fn: (...args: unknown[]) => unknown;
+  regex: RegExp;
+  paramOrder: string[];
+}
+
+interface PromptEntry {
+  def: McpPromptDefinition;
+  fn: (...args: unknown[]) => unknown;
+  paramOrder: string[];
+  inputSchema: Record<string, unknown>;
+}
+
+/**
+ * The shared dispatch core: named→positional bridge + await + throw handling.
+ * Tools, resources, and prompts ALL run through this so they execute identically
+ * (the one place a function is actually called). Returns the RAW value so each
+ * caller can serialize/inspect it as its primitive needs.
+ */
+async function runCallable(
+  fn: (...args: unknown[]) => unknown,
+  paramOrder: string[],
+  args: Record<string, unknown>,
+): Promise<{ ok: true; value: unknown } | { ok: false; message: string }> {
+  try {
+    // Named → positional: rebuild the argument list in the schema's parameter
+    // order. Omitted params arrive as `undefined`, so JS defaults fire. await
+    // covers both sync and async functions.
+    const positional = paramOrder.map((p) => args[p]);
+    const value = await fn(...positional);
+    return { ok: true, value };
+  } catch (err) {
+    // A throwing function must never crash the host — surface it as an error.
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resource URI templates + serialization
+// ---------------------------------------------------------------------------
+
+const TEMPLATE_VAR = /\{([A-Za-z0-9_]+)\}/g;
+
+/** Escape a literal slice of a URI template for embedding in a RegExp. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Compile a `{var}` URI template into an anchored RegExp with one named capture
+ * group per variable. Each variable matches a single path-ish segment
+ * (`[^/]+`), so `users://{id}` matches `users://42` (id = "42").
+ */
+function templateToRegex(uriTemplate: string): RegExp {
+  let pattern = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  TEMPLATE_VAR.lastIndex = 0;
+  while ((m = TEMPLATE_VAR.exec(uriTemplate)) !== null) {
+    pattern += escapeRegex(uriTemplate.slice(last, m.index));
+    pattern += `(?<${m[1]}>[^/]+)`;
+    last = m.index + m[0].length;
+  }
+  pattern += escapeRegex(uriTemplate.slice(last));
+  return new RegExp(`^${pattern}$`);
+}
+
+/** Best-effort percent-decode of an extracted URI value. */
+function decodeMaybe(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * Coerce extracted (string) URI values toward their declared scalar types so the
+ * shared validator and the function see the right runtime type. Anything we can't
+ * cleanly coerce is left as the string, which then fails validation fail-loud.
+ */
+function coerceVars(
+  raw: Record<string, unknown>,
+  inputSchema: Record<string, unknown>,
+): Record<string, unknown> {
+  const props = (inputSchema.properties ?? {}) as Record<string, Record<string, unknown>>;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    out[k] = typeof v === "string" ? coerceScalar(v, props[k]) : v;
+  }
+  return out;
+}
+
+function coerceScalar(value: string, schema: Record<string, unknown> | undefined): unknown {
+  const type = schema?.type;
+  if (type === "number") {
+    const n = Number(value);
+    return value.trim() !== "" && !Number.isNaN(n) ? n : value;
+  }
+  if (type === "boolean") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+  return value;
+}
+
+/** Serialize a resource function's return into MCP content (text + mime type). */
+function serializeResource(
+  uri: string,
+  value: unknown,
+  mimeOverride: string | undefined,
+): ReadResourceOutcome {
+  const isString = typeof value === "string";
+  const mimeType = mimeOverride ?? (isString ? "text/plain" : "application/json");
+  const text = isString ? (value as string) : safeStringify(value);
+  return { kind: "ok", uri, mimeType, text };
+}
+
+// ---------------------------------------------------------------------------
+// Prompt argument schema + return shaping
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a tool-style input schema from a prompt's arguments. Prompt arguments
+ * cross the wire as strings, so every property is `{ type: "string" }`; this
+ * lets the SHARED validator enforce required-ness and string-ness uniformly.
+ */
+function promptArgsToSchema(args: McpPromptDefinition["arguments"]): Record<string, unknown> {
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+  for (const a of args) {
+    properties[a.name] = a.description
+      ? { type: "string", description: a.description }
+      : { type: "string" };
+    if (a.required) required.push(a.name);
+  }
+  return { type: "object", properties, ...(required.length > 0 ? { required } : {}) };
+}
+
+/**
+ * Shape a prompt function's return into messages, fail-loud on shapes we can't
+ * handle:
+ *   - a string → a single { role: "user", content: { type: "text", text } }.
+ *   - an array of { role, content } objects → passed through as-is (a bare string
+ *     content is wrapped into a text block for convenience).
+ * Anything else (number, null, a non-message object, an array with a malformed
+ * item) is rejected so the failure is loud rather than an opaque downstream one.
+ */
+function shapePromptMessages(
+  value: unknown,
+): { ok: true; messages: PromptMessage[] } | { ok: false; message: string } {
+  if (typeof value === "string") {
+    return { ok: true, messages: [{ role: "user", content: { type: "text", text: value } }] };
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return { ok: false, message: "prompt returned an empty message array" };
+    }
+    const messages: PromptMessage[] = [];
+    for (let i = 0; i < value.length; i++) {
+      const item = value[i];
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return { ok: false, message: `prompt message [${i}] is not an object` };
+      }
+      const role = (item as Record<string, unknown>).role;
+      if (role !== "user" && role !== "assistant") {
+        return { ok: false, message: `prompt message [${i}] has an invalid role (expected "user" or "assistant")` };
+      }
+      let content = (item as Record<string, unknown>).content;
+      if (typeof content === "string") content = { type: "text", text: content };
+      if (!content || typeof content !== "object") {
+        return { ok: false, message: `prompt message [${i}] has invalid content` };
+      }
+      messages.push({ role, content });
+    }
+    return { ok: true, messages };
+  }
+  return {
+    ok: false,
+    message: `a prompt function must return a string or an array of { role, content } messages, got ${describe(value)}`,
   };
 }
 

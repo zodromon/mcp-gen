@@ -32,6 +32,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
   McpError,
   ErrorCode,
   type CallToolResult,
@@ -123,10 +128,21 @@ export async function startServer(options: ServeOptions): Promise<ServeHandle> {
   }
 
   // 5. Low-level SDK Server. tools/list returns the generated tool objects
-  //    verbatim — the raw JSON Schema flows through untouched.
+  //    verbatim — the raw JSON Schema flows through untouched. Resource and
+  //    prompt capabilities are advertised (and their handlers registered) only
+  //    when the file actually inferred any — a tool-only file behaves exactly as
+  //    before (no resources/prompts capability).
+  const hasResources = bundle.resources.length > 0 || bundle.resourceTemplates.length > 0;
+  const hasPrompts = bundle.prompts.length > 0;
   const server = new Server(
-    { name: "mcp-gen", version: "1.0.0" },
-    { capabilities: { tools: {} } },
+    { name: "mcp-gen", version: "1.1.0" },
+    {
+      capabilities: {
+        tools: {},
+        ...(hasResources ? { resources: {} } : {}),
+        ...(hasPrompts ? { prompts: {} } : {}),
+      },
+    },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -138,6 +154,76 @@ export async function startServer(options: ServeOptions): Promise<ServeHandle> {
       }),
     ),
   }));
+
+  // Resources: list (static), list-templates, and read — all routed through the
+  // shared callable seam so a read executes a function identically to a tool.
+  if (hasResources) {
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: bundle.resources.map((r) => ({
+        uri: r.uri,
+        name: r.name,
+        description: r.description,
+        ...(r.mimeType ? { mimeType: r.mimeType } : {}),
+      })),
+    }));
+
+    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+      resourceTemplates: bundle.resourceTemplates.map((t) => ({
+        uriTemplate: t.uriTemplate,
+        name: t.name,
+        description: t.description,
+        ...(t.mimeType ? { mimeType: t.mimeType } : {}),
+      })),
+    }));
+
+    server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+      const outcome = await bundle.readResource(req.params.uri);
+      switch (outcome.kind) {
+        case "unknownResource":
+        case "invalidParams":
+          throw new McpError(ErrorCode.InvalidParams, outcome.message);
+        case "toolError":
+          throw new McpError(ErrorCode.InternalError, outcome.message);
+        case "ok":
+          return {
+            contents: [{ uri: outcome.uri, mimeType: outcome.mimeType, text: outcome.text }],
+          };
+      }
+    });
+  }
+
+  // Prompts: list and get — get is routed through the shared seam and its return
+  // is shaped into messages (string → one user message; message array → as-is).
+  if (hasPrompts) {
+    server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+      prompts: bundle.prompts.map((p) => ({
+        name: p.name,
+        description: p.description,
+        arguments: p.arguments.map((a) => ({
+          name: a.name,
+          ...(a.description ? { description: a.description } : {}),
+          required: a.required,
+        })),
+      })),
+    }));
+
+    server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+      const outcome = await bundle.getPrompt(
+        req.params.name,
+        (req.params.arguments ?? {}) as Record<string, string>,
+      );
+      switch (outcome.kind) {
+        case "unknownPrompt":
+        case "invalidParams":
+          throw new McpError(ErrorCode.InvalidParams, outcome.message);
+        case "toolError":
+        case "invalidReturn":
+          throw new McpError(ErrorCode.InternalError, outcome.message);
+        case "ok":
+          return { description: outcome.description, messages: outcome.messages };
+      }
+    });
+  }
 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
     const { name, arguments: rawArgs } = req.params;
@@ -199,6 +285,18 @@ export async function startServer(options: ServeOptions): Promise<ServeHandle> {
   console.error(
     `serving ${toolNames.length} tool${toolNames.length === 1 ? "" : "s"}: ${toolNames.join(", ")}`,
   );
+  const resourceCount = bundle.resources.length + bundle.resourceTemplates.length;
+  if (resourceCount > 0) {
+    const names = [
+      ...bundle.resources.map((r) => r.uri),
+      ...bundle.resourceTemplates.map((t) => t.uriTemplate),
+    ];
+    console.error(`serving ${resourceCount} resource${resourceCount === 1 ? "" : "s"}: ${names.join(", ")}`);
+  }
+  if (bundle.prompts.length > 0) {
+    const names = bundle.prompts.map((p) => p.name);
+    console.error(`serving ${names.length} prompt${names.length === 1 ? "" : "s"}: ${names.join(", ")}`);
+  }
 
   const close = async (): Promise<void> => {
     await transport.close().catch(() => {});

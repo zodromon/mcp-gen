@@ -43,6 +43,59 @@ export interface McpToolDefinition {
   _returnType: { text: string; awaitedSchema: Record<string, unknown> };
 }
 
+/**
+ * A static MCP resource inferred from an `@resource <uri>` function whose URI has
+ * no `{var}` template variables. Reading it calls the function with no arguments
+ * and serializes the return value (see the callable seam). `mimeType` is set only
+ * when an `@mime` tag overrides the inferred type (string → text/plain, otherwise
+ * application/json, decided at read time).
+ */
+export interface McpResourceDefinition {
+  name: string;
+  uri: string;
+  description: string;
+  mimeType?: string;
+}
+
+/**
+ * A resource template inferred from an `@resource <uri>` whose URI carries
+ * RFC-6570-style `{var}` variables. Every variable must match a function
+ * parameter by name (enforced at generation time — a mismatch excludes the
+ * function and is reported in `errors`, the same fail-loud contract as tools).
+ * `inputSchema` is built exactly like a tool's (same type engine, same `@param`
+ * descriptions) over the function's parameters, so the extracted URI values can
+ * be validated with the shared tool-arg validator before the function runs.
+ */
+export interface McpResourceTemplateDefinition {
+  name: string;
+  uriTemplate: string;
+  description: string;
+  /** The `{var}` names parsed from the URI, in template order. */
+  variables: string[];
+  inputSchema: Record<string, unknown>;
+  mimeType?: string;
+}
+
+/** One argument of a prompt — derived from a function parameter. */
+export interface McpPromptArgument {
+  name: string;
+  description?: string;
+  required: boolean;
+}
+
+/**
+ * A prompt inferred from an `@prompt` function. The function's parameters become
+ * the prompt's arguments (name + `@param` description; required iff non-optional).
+ * prompts/get calls the function with the supplied (string) arguments — a string
+ * return becomes a single user text message, an array of `{ role, content }`
+ * messages is passed through (handled in the callable seam).
+ */
+export interface McpPromptDefinition {
+  name: string;
+  description: string;
+  arguments: McpPromptArgument[];
+}
+
 export interface GenerateOptions {
   debug?: boolean;
   /**
@@ -74,9 +127,20 @@ export interface ToolError {
 }
 
 export interface GenerateResult {
-  /** Only cleanly-converted (or widened) functions. */
+  /** Only cleanly-converted (or widened) functions tagged as tools (untagged). */
   tools: McpToolDefinition[];
-  /** Function-level hard failures; these functions are absent from `tools`. */
+  /** Static resources (`@resource <uri>` with no template variables). */
+  resources: McpResourceDefinition[];
+  /** Resource templates (`@resource <uri>` with `{var}` template variables). */
+  resourceTemplates: McpResourceTemplateDefinition[];
+  /** Prompts (`@prompt`). */
+  prompts: McpPromptDefinition[];
+  /**
+   * Function-level hard failures; these functions are absent from `tools`,
+   * `resources`, `resourceTemplates`, and `prompts`. Resource/prompt inference
+   * shares this fail-loud channel: an unconvertible template, an `@resource`
+   * with no URI, or a function tagged both `@resource` and `@prompt` lands here.
+   */
   errors: ToolError[];
   /** Soft notes (constraint widening, `{}` fallback, skipped exports). */
   warnings: string[];
@@ -634,6 +698,108 @@ function getJsDocInfo(docSource: DocSource): {
 }
 
 // ---------------------------------------------------------------------------
+// Primitive classification (tool vs resource vs prompt)
+// ---------------------------------------------------------------------------
+
+/**
+ * The one disambiguation rule (from the JSDoc of each exported function):
+ *   - no `@resource`/`@prompt` tag → a tool (the unchanged path).
+ *   - `@resource <uri>`          → a resource (static, or a template if the URI
+ *                                  carries `{var}` variables).
+ *   - `@prompt`                  → a prompt.
+ * A function tagged BOTH `@resource` and `@prompt`, or `@resource` with no URI,
+ * is unconvertible → an `error` (fail-loud; never half-registered).
+ */
+type Classification =
+  | { kind: "tool" }
+  | { kind: "resource"; uri: string; mime?: string }
+  | { kind: "prompt" }
+  | { kind: "error"; message: string };
+
+function classifyExport(docSource: DocSource): Classification {
+  let hasResourceTag = false;
+  let resourceUri: string | undefined;
+  let isPrompt = false;
+  let mime: string | undefined;
+
+  // Use ONLY the function's own doc comment — the last JSDoc block immediately
+  // preceding it. A file-header block comment can be attached to the first
+  // export too; reading every block would let a stray `@resource`/`@prompt`
+  // mentioned in that header misclassify the function.
+  const docs = docSource.getJsDocs();
+  const ownDoc = docs[docs.length - 1];
+  if (ownDoc) {
+    for (const tag of ownDoc.getTags()) {
+      const tagName = tag.getTagName();
+      if (tagName === "resource") {
+        hasResourceTag = true;
+        const text = (tag.getCommentText() ?? "").trim();
+        if (text) resourceUri = text;
+      } else if (tagName === "prompt") {
+        isPrompt = true;
+      } else if (tagName === "mime") {
+        const text = (tag.getCommentText() ?? "").trim();
+        if (text) mime = text;
+      }
+    }
+  }
+
+  if (hasResourceTag && isPrompt) {
+    return {
+      kind: "error",
+      message: "excluded: tagged both @resource and @prompt — a function may be one primitive, not both.",
+    };
+  }
+  if (isPrompt) return { kind: "prompt" };
+  if (hasResourceTag) {
+    if (!resourceUri) {
+      return { kind: "error", message: "excluded: @resource requires a URI (e.g. @resource users://{id})." };
+    }
+    return { kind: "resource", uri: resourceUri, mime };
+  }
+  return { kind: "tool" };
+}
+
+/**
+ * Convert a function's parameters to an object JSON Schema's `properties` +
+ * `required` — the same per-parameter loop the tool path uses (same type engine,
+ * same `@param` descriptions). Hard input-position failures accumulate in
+ * `ctx.failures`, so the caller can exclude the function fail-loud. Shared by the
+ * resource-template path; the tool path keeps its own inline loop unchanged.
+ */
+function buildParamSchema(
+  ctx: Ctx,
+  fn: FunctionDeclaration | ArrowFunction | FunctionExpression,
+  paramDocs: Map<string, string>,
+  name: string,
+): { properties: Record<string, unknown>; required: string[] } {
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+  ctx.position = "input";
+  for (const param of fn.getParameters()) {
+    const paramName = param.getName();
+    const schema = typeToJsonSchema(ctx, param.getType(), param, `${name}(${paramName})`);
+    const doc = paramDocs.get(paramName);
+    if (doc && typeof schema === "object") schema.description = doc;
+    properties[paramName] = schema;
+    if (!param.isOptional()) required.push(paramName);
+  }
+  return { properties, required };
+}
+
+/** RFC-6570-style `{var}` template variables — simple names only. */
+const TEMPLATE_VAR = /\{([A-Za-z0-9_]+)\}/g;
+
+/** Parse the `{var}` names from a URI template, in order of appearance. */
+export function parseTemplateVars(uri: string): string[] {
+  const vars: string[] = [];
+  let m: RegExpExecArray | null;
+  TEMPLATE_VAR.lastIndex = 0;
+  while ((m = TEMPLATE_VAR.exec(uri)) !== null) vars.push(m[1]);
+  return vars;
+}
+
+// ---------------------------------------------------------------------------
 // Project resolution context
 // ---------------------------------------------------------------------------
 
@@ -704,6 +870,9 @@ export function generateTools(filePath: string, options: GenerateOptions = {}): 
   };
 
   const tools: McpToolDefinition[] = [];
+  const resources: McpResourceDefinition[] = [];
+  const resourceTemplates: McpResourceTemplateDefinition[] = [];
+  const prompts: McpPromptDefinition[] = [];
   const errors: ToolError[] = [];
   const warnings: string[] = [];
   const debugDump: Record<string, unknown>[] = [];
@@ -719,6 +888,87 @@ export function generateTools(filePath: string, options: GenerateOptions = {}): 
     ctx.failures = [];
     ctx.pendingWarnings = [];
 
+    // The one disambiguation rule: read the JSDoc to decide tool/resource/prompt.
+    // An untagged function falls through to the unchanged tool path below.
+    const cls = classifyExport(docSource);
+
+    if (cls.kind === "error") {
+      errors.push({ function: name, message: cls.message });
+      continue;
+    }
+
+    if (cls.kind === "prompt") {
+      // Parameters become the prompt's arguments (name + @param description;
+      // required iff non-optional). Reuses the existing param extraction; no
+      // JSON Schema conversion (prompt arguments cross the wire as strings).
+      const args: McpPromptArgument[] = [];
+      for (const param of fn.getParameters()) {
+        const arg: McpPromptArgument = { name: param.getName(), required: !param.isOptional() };
+        const doc = paramDocs.get(param.getName());
+        if (doc) arg.description = doc;
+        args.push(arg);
+      }
+      prompts.push({ name, description: description ?? "", arguments: args });
+      continue;
+    }
+
+    if (cls.kind === "resource") {
+      const vars = parseTemplateVars(cls.uri);
+      if (vars.length === 0) {
+        // No template variables → a static resource. Read with no arguments.
+        resources.push({
+          name,
+          uri: cls.uri,
+          description: description ?? "",
+          ...(cls.mime ? { mimeType: cls.mime } : {}),
+        });
+        continue;
+      }
+      // A resource template: every {var} must match a parameter by name. A
+      // mismatch is unconvertible → fail-loud (excluded + reported, never
+      // half-registered — the same contract as tools).
+      const paramNames = new Set(fn.getParameters().map((p) => p.getName()));
+      const missing = vars.filter((v) => !paramNames.has(v));
+      if (missing.length > 0) {
+        errors.push({
+          function: name,
+          message:
+            `excluded from resources: @resource template '${cls.uri}' has ` +
+            `${missing.length > 1 ? "variables" : "variable"} ${missing.map((v) => `{${v}}`).join(", ")} ` +
+            `with no matching function parameter.`,
+        });
+        continue;
+      }
+      // Build the input schema exactly like a tool's (same type engine, same
+      // @param descriptions) so the extracted URI values validate with the
+      // shared tool-arg validator. Input-position failures exclude the resource.
+      const { properties: rProps, required: rRequired } = buildParamSchema(ctx, fn, paramDocs, name);
+      if (ctx.failures.length > 0) {
+        const n = ctx.failures.length;
+        errors.push({
+          function: name,
+          message: `excluded from resources: ${n} parameter type${n > 1 ? "s" : ""} could not be converted to a JSON Schema`,
+          failures: ctx.failures,
+        });
+        continue;
+      }
+      warnings.push(...ctx.pendingWarnings);
+      resourceTemplates.push({
+        name,
+        uriTemplate: cls.uri,
+        description: description ?? "",
+        variables: vars,
+        inputSchema: {
+          type: "object",
+          properties: rProps,
+          ...(rRequired.length > 0 ? { required: rRequired } : {}),
+        },
+        ...(cls.mime ? { mimeType: cls.mime } : {}),
+      });
+      continue;
+    }
+
+    // cls.kind === "tool": the original, byte-for-byte-unchanged tool path.
     const properties: Record<string, unknown> = {};
     const required: string[] = [];
     const paramDebug: Record<string, unknown>[] = [];
@@ -787,6 +1037,9 @@ export function generateTools(filePath: string, options: GenerateOptions = {}): 
 
   return {
     tools,
+    resources,
+    resourceTemplates,
+    prompts,
     errors,
     warnings,
     rawTypeDebug: debugDump,
