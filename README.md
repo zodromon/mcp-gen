@@ -2,6 +2,8 @@
 
 > Turn your typed TypeScript functions into an MCP server. No schema library, no decorators, no boilerplate — the schema is inferred from your types.
 
+![mcp-gen: a typed TypeScript function becomes an MCP server's tool schema](assets/mcp-gen-demo.gif)
+
 `mcp-gen` reads exported TypeScript functions and generates [Model Context Protocol](https://modelcontextprotocol.io) **tool, resource, and prompt** definitions from them — using the TypeScript type checker (via [ts-morph](https://ts-morph.com)) to turn each parameter type into a JSON Schema and each JSDoc comment into a description. It can emit the schemas as JSON, serve a live MCP server, or open a **live playground** where you call your tools in a browser while you edit.
 
 If your functions are typed, they're already MCP tools.
